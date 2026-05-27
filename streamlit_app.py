@@ -20,6 +20,7 @@ DATA_DIR = BASE_DIR / "data"
 IMAGES_DIR = BASE_DIR / "assets" / "images"
 HERO_IMAGE_FILE = IMAGES_DIR / "apresentacao" / "pres_slide01.png"
 REGISTROS_FILE = DATA_DIR / "registros_residuos.json"
+IMAGENS_MANIFEST_FILE = DATA_DIR / "imagens_manifest.json"
 AVISO_LEGAL_DISCLAIMER = (
     "Aviso Legal: Este trabalho foi desenvolvido para fins exclusivamente acadêmicos. "
     "Todos os dados, nomes, marcas, logotipos e imagens das empresas citadas foram utilizados "
@@ -53,6 +54,43 @@ IMAGENS_SECOES = {
         ("apresentacao/pres_slide21.png", "Tabela de acompanhamento técnico"),
     ],
 }
+
+
+def listar_diretorios_data() -> list[Path]:
+    """Procura a pasta data em caminhos comuns do projeto e do deploy."""
+    candidatos = [
+        DATA_DIR,
+        BASE_DIR / "Data",
+        Path.cwd() / "data",
+        Path.cwd() / "Data",
+        BASE_DIR.parent / "data",
+        Path.cwd().parent / "data",
+    ]
+    unicos: list[Path] = []
+    vistos: set[str] = set()
+    for pasta in candidatos:
+        chave = str(pasta.resolve()) if pasta.exists() else str(pasta)
+        if chave in vistos:
+            continue
+        vistos.add(chave)
+        unicos.append(pasta)
+    return unicos
+
+
+@st.cache_data(show_spinner=False, ttl=600)
+def carregar_manifest_imagens() -> list[dict]:
+    """Carrega a lista das imagens incluídas no projeto para uso no deploy."""
+    for pasta_data in listar_diretorios_data():
+        arquivo = pasta_data / "imagens_manifest.json"
+        if not arquivo.exists():
+            continue
+        try:
+            conteudo = json.loads(arquivo.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(conteudo, list):
+            return [item for item in conteudo if isinstance(item, dict)]
+    return []
 
 TIPOS_RESIDUO_POR_CLASSE = {
     "Classe I": [
@@ -1054,29 +1092,36 @@ def carregar_imagens_locais_cache() -> dict[str, bytes]:
         if not pasta.exists() or not pasta.is_dir():
             continue
         try:
-            arquivos = sorted([arq for arq in pasta.iterdir() if arq.is_file()])
+            arquivos = sorted([arq for arq in pasta.rglob("*") if arq.is_file()])
         except OSError:
             continue
 
         for arquivo in arquivos:
             if arquivo.suffix.lower() not in extensoes:
                 continue
-            chave = arquivo.name.lower()
-            if chave in imagens:
-                continue
+            chaves = [arquivo.name.lower()]
             try:
-                imagens[chave] = arquivo.read_bytes()
+                chaves.append(str(arquivo.relative_to(pasta)).replace("\\", "/").lower())
+            except ValueError:
+                pass
+            try:
+                dados = arquivo.read_bytes()
             except OSError:
                 continue
+            for chave in chaves:
+                if chave and chave not in imagens:
+                    imagens[chave] = dados
 
     return imagens
 
 
 def obter_bytes_imagem_local(nome_arquivo: str) -> bytes | None:
-    nome_base = extrair_nome_arquivo_imagem(nome_arquivo).lower()
-    if not nome_base:
+    referencia = str(nome_arquivo or "").strip().replace("\\", "/").lower()
+    nome_base = extrair_nome_arquivo_imagem(referencia).lower()
+    if not nome_base and not referencia:
         return None
-    return carregar_imagens_locais_cache().get(nome_base)
+    imagens = carregar_imagens_locais_cache()
+    return imagens.get(referencia) or imagens.get(nome_base)
 
 
 def normalizar_base_url(url: str) -> str:
@@ -1478,30 +1523,63 @@ def listar_urls_slides_remotos() -> list[str]:
 
 
 def gerar_slides_fallback_por_imagens() -> list[dict]:
+    manifest = carregar_manifest_imagens()
+    if manifest:
+        slides_manifest: list[dict] = []
+        for idx, item in enumerate(manifest, start=1):
+            referencia = str(item.get("path", "")).strip()
+            if not referencia:
+                continue
+            numero = int(item.get("slide", idx) or idx)
+            titulo = normalizar_texto(str(item.get("title", f"Slide {numero}")))
+            texto = normalizar_texto(str(item.get("description", f"Imagem de apoio: {referencia}")))
+            slides_manifest.append(
+                {
+                    "slide": numero,
+                    "title": titulo,
+                    "texts": [texto] if texto else [],
+                    "images": [referencia],
+                }
+            )
+        if slides_manifest:
+            return slides_manifest
+
     mapa_legendas: dict[str, str] = {}
     for imagens_secao in IMAGENS_SECOES.values():
         for nome, legenda in imagens_secao:
-            if nome not in mapa_legendas:
-                mapa_legendas[nome] = legenda
+            nome_base = extrair_nome_arquivo_imagem(nome).lower()
+            if nome_base and nome_base not in mapa_legendas:
+                mapa_legendas[nome_base] = normalizar_texto(legenda)
 
     mapa_arquivos = indexar_arquivos_imagem()
-    padrao = re.compile(r"^image(\d+)\.(png|jpg|jpeg|webp|gif|bmp)$", re.I)
-    nomes = [nome for nome in mapa_arquivos.keys() if padrao.match(nome)]
+    padrao_image = re.compile(r"^image(\d+)\.(png|jpg|jpeg|webp|gif|bmp)$", re.I)
+    padrao_pres = re.compile(r"^pres_slide0?(\d+)\.(png|jpg|jpeg|webp|gif|bmp)$", re.I)
+    padrao_pptx = re.compile(r"^slide[_ -]?0?(\d+)(?:[_ -]\d+)?\.(png|jpg|jpeg|webp|gif|bmp)$", re.I)
+    nomes = [
+        nome
+        for nome in mapa_arquivos.keys()
+        if padrao_image.match(nome) or padrao_pres.match(nome) or padrao_pptx.match(nome)
+    ]
     if not nomes:
         return []
 
     def chave_ordenacao(nome: str) -> tuple[int, str]:
-        match = padrao.match(nome)
+        match = padrao_image.match(nome) or padrao_pres.match(nome) or padrao_pptx.match(nome)
         numero = int(match.group(1)) if match else 10**9
         return (numero, nome)
 
     nomes.sort(key=chave_ordenacao)
     slides: list[dict] = []
-    for idx, nome in enumerate(nomes, start=1):
-        titulo = mapa_legendas.get(nome, f"Slide {idx}")
+    vistos_slides: set[int] = set()
+    for nome in nomes:
+        numero = chave_ordenacao(nome)[0]
+        if numero in vistos_slides:
+            continue
+        vistos_slides.add(numero)
+        titulo = mapa_legendas.get(nome, f"Slide {numero}")
         slides.append(
             {
-                "slide": idx,
+                "slide": numero,
                 "title": normalizar_texto(titulo),
                 "texts": [f"Imagem de apoio: {nome}"],
                 "images": [nome],
@@ -1513,19 +1591,20 @@ def gerar_slides_fallback_por_imagens() -> list[dict]:
 @st.cache_data(show_spinner=False, ttl=600)
 def carregar_slides() -> list[dict]:
     fontes_locais: list[tuple[str, str]] = []
-    slides_json_file = DATA_DIR / "slides.json"
-    slides_js_file = DATA_DIR / "slides-data.js"
+    for pasta_data in listar_diretorios_data():
+        slides_json_file = pasta_data / "slides.json"
+        slides_js_file = pasta_data / "slides-data.js"
 
-    if slides_json_file.exists():
-        try:
-            fontes_locais.append(("json", slides_json_file.read_text(encoding="utf-8")))
-        except OSError:
-            pass
-    if slides_js_file.exists():
-        try:
-            fontes_locais.append(("js", slides_js_file.read_text(encoding="utf-8")))
-        except OSError:
-            pass
+        if slides_json_file.exists():
+            try:
+                fontes_locais.append(("json", slides_json_file.read_text(encoding="utf-8")))
+            except OSError:
+                pass
+        if slides_js_file.exists():
+            try:
+                fontes_locais.append(("js", slides_js_file.read_text(encoding="utf-8")))
+            except OSError:
+                pass
 
     for tipo, conteudo_texto in fontes_locais:
         try:
@@ -1708,8 +1787,11 @@ def exibir_galeria() -> None:
                 "\n".join(
                     [
                         f"DATA_DIR: {DATA_DIR}",
-                        f"slides.json existe: {(DATA_DIR / 'slides.json').exists()}",
-                        f"slides-data.js existe: {(DATA_DIR / 'slides-data.js').exists()}",
+                        "Pastas data testadas:",
+                        *[
+                            f"- {pasta} | slides.json: {(pasta / 'slides.json').exists()} | slides-data.js: {(pasta / 'slides-data.js').exists()}"
+                            for pasta in listar_diretorios_data()
+                        ],
                         f"URLs remotas testadas: {listar_urls_slides_remotos()}",
                     ]
                 )
